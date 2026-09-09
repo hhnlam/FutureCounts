@@ -1,0 +1,500 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Config for the decoded-frame + online-VideoMAE repetition-counting pipeline.
+# Every key can be overridden on the CLI, e.g.  python train.py --epochs 100
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── data ──────────────────────────────────────────────────────────────────────
+# decoded_frame_root: list of roots produced by preprocess_frames.py. Combine
+# RepCount + Countix simply by listing both.
+decoded_frame_root:
+  # - cache/decoded_frames/countix_density/train
+  - cache/decoded_frames/repcount_notrim/train
+  # - cache/decoded_frames/repcount/val
+  # - cache/decoded_frames/repcount/test
+val_frame_root:
+  # - cache/decoded_frames/countix_density/val
+  - cache/decoded_frames/repcount_notrim/val
+
+# use_cached_features: false (default) -- online encoding, unchanged legacy
+# behaviour: FrameClipDataset loads raw frames from decoded_frame_root and
+# train.py runs the (frozen) encoder on them every step, every epoch, even
+# though the encoder's output for a given crop never changes. true: skip
+# that redundant forward pass -- train_ds becomes CachedFeatureClipDataset,
+# reading a precomputed feature tensor from cached_feature_root instead
+# (see extract_encoder_cache.py, which builds that cache; empirically ~15.6h
+# of cumulative online-encoder compute over a 200-epoch run collapsed to
+# ~40min one-time). STRICT requirement: crop_mode="cycle" and cycle_jitter=0
+# -- the cache only covers exact cycle-boundary starts (see
+# dataset.CachedFeatureClipDataset's docstring for why); train.py raises at
+# startup if this doesn't hold, or if full_video_sampling.enabled=true
+# (that path tiles+encodes the whole video itself, bypassing the cache).
+use_cached_features: false
+cached_feature_root:
+  # - cache/encoded_features/countix/train
+  # - cache/encoded_features/repcount_aug/train
+  []                            # only read when use_cached_features=true.
+                              # Points at extract_encoder_cache.py's OUTPUT
+                              # (one dir per video: metadata.json +
+                              # start_<c>.pt), NOT at decoded_frame_root's
+                              # raw-frame dirs -- decoded_frame_root stays
+                              # informational in this mode (documents where
+                              # the frames that got encoded actually live).
+
+# dataset_root is informational (where raw videos live); not needed once frames
+# are decoded, but recorded for provenance.
+dataset_root: /workspace/dataset
+
+# resize_mode: how frames get to a square (image_size, image_size) tensor, at
+# BOTH preprocess_frames.py's decode-time resize (real effect on the cache)
+# and dataset.py's load-time Preprocess (a no-op for already-cached frames,
+# but the real resize for scripts reading raw video directly, e.g. infer.py).
+#   'squash'          (default) -- resize straight to (size, size), ignoring
+#                      aspect ratio. Cheap, matches this pipeline's original
+#                      behaviour, but stretches non-square source video.
+#   'short_side_crop'  -- resize so the shorter side is `size` (aspect ratio
+#                      preserved), then center-crop to (size, size) --
+#                      standard ImageNet-style preprocessing. Changing this
+#                      only affects videos decoded AFTER the change -- re-run
+#                      preprocess_frames.py --resize_mode short_side_crop
+#                      --overwrite to rebuild an existing cache.
+resize_mode: squash
+
+# ── temporal cropping ─────────────────────────────────────────────────────────
+clip_length: 128               # frames per training clip
+temporal_stride: 1            # sample every k-th frame within a clip
+validation_window_stride: 32  # sliding-window stride at validation
+validation_window_aggregation: mean  # how overlapping validation windows' per-frame
+                              # density/phase/in_rep predictions get combined onto
+                              # one timeline (utils.sliding_window_inference).
+                              #   'mean'   (default) -- arithmetic mean, unchanged
+                              #            behaviour. When windows disagree about
+                              #            exactly where a peak sits (more likely
+                              #            when repetitions are packed densely
+                              #            relative to clip_length, e.g. Countix),
+                              #            averaging blends the disagreement into a
+                              #            wider/lower blob -- can merge two true
+                              #            peaks into one and worsen undercounting.
+                              #   'median' -- per-position median across every
+                              #            window covering it instead. More robust
+                              #            to an outlier window's disagreement,
+                              #            without smearing it into neighbours.
+                              #            Costs extra memory (stacks every
+                              #            window's full contribution instead of
+                              #            one running accumulator) -- fine at
+                              #            this pipeline's video lengths/window
+                              #            counts. Eval-only (sliding_window_
+                              #            inference); does not affect training.
+crop_mode: uniform              # 'cycle': start clips on a repetition boundary
+                              # (RepCount); 'uniform': any random start.
+cycle_jitter: 15               # +/- frames of jitter around the rep boundary
+                              # (crop_mode=cycle). 0 = exactly on the boundary.
+
+# ── full-video count supervision (opt-in training augmentation) ───────────────
+# Each epoch, `fraction` of videos are excluded from the normal one-random-crop
+# path and instead get a single whole-video training step: tile the entire
+# video into clip_length windows (same scheme sliding_window_inference uses at
+# eval), stitch the per-window density predictions into one full-length curve,
+# sum it to a predicted total count, and backprop just the count loss (same
+# CountLoss/count_mode as the normal path) against that video's ground-truth
+# count. Targets accumulated-error undercounting directly, since it trains
+# against the same stitched-count signal eval measures, rather than only ever
+# seeing independent per-window density losses. The other (1 - fraction) of
+# videos are completely unaffected. Which videos are "full" is re-chosen every
+# epoch. Single-GPU only: enabling this together with DDP raises a clear error
+# at startup.
+full_video_sampling:
+  enabled: false            # false (default): identical to current behaviour.
+  fraction: 0.3             # fraction of videos given the full-video count step each epoch.
+  window_stride: null       # stride (temporal_stride-subsampled frames, same
+                            # units as validation_window_stride) between
+                            # windows when tiling a full video. null ->
+                            # clip_length (non-overlapping, bounds extra
+                            # compute). Deliberately separate from
+                            # validation_window_stride (that one is eval-only).
+
+# ── VideoMAE encoder (frozen) ─────────────────────────────────────────────────
+encoder: videomae                            # 'videomae' | 'dinov2' | 'r2plus1d18' (swappable)
+videomae_backbone: MCG-NJU/videomae-base     # backbone checkpoint, MCG-NJU/videomae-base-finetuned-kinetics
+                                              # only read when encoder=videomae|dinov2 (as that
+                                              # encoder's model_name); ignored by r2plus1d18, which
+                                              # has only one pretrained variant (torchvision's
+                                              # Kinetics-400 R(2+1)D-18) and no model_name to choose.
+encoder_pooling: grid                        # 'mean' -> (B,T,D); 'grid' -> (B,T,S,D). videomae only --
+                                              # r2plus1d18/dinov2 always mean-pool (B,T,D).
+encoder_spatial_grid: 4                      # grid side when encoder_pooling=grid (videomae only)
+encoder_return_intermediate: null            # int hidden-state index, or null (videomae only)
+encoder_interp_time: false                    # true (default, cheap): VideoMAE natively emits
+                                              # T/tubelet_size temporal tokens; linearly
+                                              # interpolate them back up to T so every other
+                                              # output token is a synthetic blend of its neighbours.
+                                              # false (exact, ~2x encoder compute): instead of
+                                              # interpolating, feed the backbone a doubled sequence
+                                              # of real adjacent-frame pairs (t,t+1) so all T output
+                                              # tokens are genuine (non-interpolated) tubelet
+                                              # embeddings. Output is (B,T,...) either way --
+                                              # downstream (TSM, density head, GT alignment) is
+                                              # unaffected by true/false. videomae only -- r2plus1d18
+                                              # always interpolates its fixed 8x temporal downsample
+                                              # back to T (no non-interpolated alternative exists for it).
+                                              # 'downsample' (cheapest, videomae only): same T/tubelet_size
+                                              # native tokens as true, but returned AS-IS with no
+                                              # upsampling back to T and no extra encoder compute.
+                                              # Output is (B,T/2,...), NOT (B,T,...) -- breaks the
+                                              # per-frame contract. The dataset/train/eval loop
+                                              # (train.py, infer.py, evaluate_countix_ood.py) is fully
+                                              # aware of this: it reads encoder.temporal_downsample once
+                                              # after building the encoder and threads it into
+                                              # FrameClipDataset/FrameVideoDataset (GT density/phase
+                                              # built at clip_length/N // temporal_downsample instead of
+                                              # clip_length/N), CombinedLoss's fast_rep_weighted
+                                              # clip_length, and sliding_window_inference/
+                                              # sliding_window_train_count (accumulator + scatter-add
+                                              # move to token space). clip_length (and
+                                              # validation_window_stride) must stay a multiple of
+                                              # tubelet_size (2) for this to divide evenly -- both
+                                              # raise a clear ValueError otherwise. check.py's own
+                                              # load_sample bypasses all of this by sizing GT off
+                                              # feats.shape[1] directly, so it needs no changes either way.
+freeze_encoder: true                         # keep the encoder frozen (required)
+
+# ── downstream model (Linear proj + TCN + MLP heads) ───────────────────────────
+# An earlier version of this model ran a RepNet-style Temporal Self-Similarity
+# Matrix -> fixed-width conv stack (row_length/conv_channels/conv_layers) ->
+# Transformer aggregator (d_model/transformer_heads/transformer_layers) between
+# the encoder and the heads. That path was replaced by the plain linear-
+# projection + TCN pipeline below and no longer exists in model.py, so those
+# six keys are gone from this config too -- see git history if you need them.
+dropout: 0.1
+use_dilated_tcn: true        # false (default): self.tcn is a single TemporalBlock
+                              # (unchanged legacy behaviour). true: self.tcn is a
+                              # DilatedTCN stack (dilations 1,2,4,8,16) for a much
+                              # larger temporal receptive field. Changes state_dict
+                              # shape -- must match between train/eval/checkpoint
+                              # (utils.load_checkpoint uses strict=False and will
+                              # report a shape mismatch as missing/unexpected keys
+                              # rather than a hard error, but the mismatched part
+                              # of the model still won't have real trained weights).
+tcn_kernel_size: 3            # kernel size for TemporalBlock / DilatedTCN
+tcn_dilations: [1, 2, 4, 8, 16]  # only used when use_dilated_tcn: true
+tcn_dim: 1024                  # channel width of linear_proj1's output and the TCN
+                              # (TemporalBlock/DilatedTCN) stack -- also sizes
+                              # DensityHead/PhaseHead/InRepetitionHead's input_dim
+                              # and FuturePredictionHead's hidden_dim, since they
+                              # all consume the TCN's output ("rows") directly.
+                              # 256 (default) matches the original hardcoded width.
+                              # Changes state_dict shape -- must match between
+                              # train/eval/checkpoint.
+tcn_expansion: 1
+spatial_pool: True           # true when encoder_pooling=grid (learned S->1 pool)
+use_spatiotemporal: false     # false (default): legacy path -- spatial_pool collapses the
+                              # S spatial tokens to ONE vector per timestep FIRST, so
+                              # linear_proj1/tcn (and every head after them) are purely
+                              # temporal -- they have no way to use "where in the frame"
+                              # something happened, only a fixed per-timestep spatial
+                              # summary. true: replaces spatial_pool + linear_proj1 + tcn
+                              # with model.SpatioTemporalTCN, which keeps all S spatial
+                              # tokens alive through spatiotemporal_depth alternating
+                              # SpatialSelfAttention (tokens attend to EACH OTHER, same
+                              # timestep) / PerLocationTemporalBlock (each spatial
+                              # location's own trajectory convolved over time, reusing
+                              # TemporalBlock/DilatedTCN per use_dilated_tcn/tcn_kernel_size/
+                              # tcn_dilations) blocks, before a final learned S->1 pool --
+                              # i.e. genuine spatiotemporal mixing happens BEFORE any
+                              # collapse, not after. Requires spatial_pool: true and
+                              # encoder_pooling: grid (raises otherwise -- there's no S
+                              # axis to keep alive with encoder_pooling: mean). Every head
+                              # downstream (DensityHead, PhaseHead, ...) is unaffected
+                              # either way -- same (B,T,tcn_dim) contract. Meaningfully
+                              # more compute than the legacy path (a real transformer block
+                              # over S tokens at every timestep) -- see
+                              # encoder_spatial_grid above for what sets S. Changes the
+                              # state_dict shape entirely (spatial_pool/linear_proj1/tcn
+                              # don't exist as separate submodules in this mode) -- must
+                              # match between train/eval/checkpoint, like use_dilated_tcn.
+spatiotemporal_depth: 2       # number of alternating SpatialSelfAttention/
+                              # PerLocationTemporalBlock pairs in SpatioTemporalTCN. Only
+                              # used when use_spatiotemporal: true. Changes state_dict shape.
+
+# ── loss ──────────────────────────────────────────────────────────────────────
+sigma_factor: 0.4             # density kernel width (fraction of cycle duration)
+density_kernel: triangle      # per-cycle density bump shape:
+                              #   'gaussian' - exp(-0.5*(d/w)^2), unbounded tails
+                              #   'triangle' - linear taper to 0 at the edges
+                              #   'sawtooth' - linear ramp up to the cycle center, instant drop
+lambda_count: 5            # weight of the MAE(count) term
+lambda_density: 0           # weight of the MSE(density) term
+lambda_support: 0           # weight of the density support-mismatch hinge loss: penalizes
+                            # pred_density>0 where gt_density==0, and pred_density<=0 where
+                            # gt_density>0. 0 (default) disables it, identical to today.
+                            # Independent of lambda_density -- a cheap sign/support
+                            # regularizer that doesn't require turning the (currently
+                            # disabled) MSE shape loss back on.
+count_mode: repcount          # 'relative' | 'l1' | 'fast_rep_weighted'
+                        # 'fast_rep_weighted': plain L1, upweighted (1.25x/1.5x/2x) for samples
+                        # whose repetitions are fast relative to clip_length (few temporal steps
+                        # per rep = steps_per_rep = clip_length/gt_count <= 20/12/8) -- targets
+                        # high-count clips getting squashed toward the batch's low/mid-count mean.
+                        # See loss.CountLoss.
+
+# ── phase head (auxiliary, optional) ──────────────────────────────────────────
+# Investigates whether an auxiliary progress-through-cycle ("phase") task
+# improves the shared temporal representation. Purely additive: the density
+# head, its loss, and its checkpoint are unaffected either way.
+use_phase: false              # false (default): behaves EXACTLY as before this
+                              # existed -- no phase_head module, no phase loss
+                              # term, forward() returns the old (density, count)
+                              # tuple instead of a dict.
+phase_hidden_dim: 512         # PhaseHead's first hidden width
+phase_dropout: null           # null -> reuse `dropout` above
+weight_phase: 1             # loss weight; only applied when use_phase=true
+
+# ── in-repetition head (auxiliary, optional) ──────────────────────────────────
+# Investigates whether an auxiliary per-frame "is this frame inside a
+# repetition or not" binary classifier improves the shared temporal
+# representation. Independent of use_phase (own head, own BCE loss); its
+# target is phase_mask itself (already computed regardless of use_phase), so
+# no dataset changes are needed. Purely additive: the density/count/phase
+# heads, their losses, and checkpoints are unaffected either way.
+use_in_repetition: true      # false (default): behaves EXACTLY as before this
+                              # existed -- no in_rep_head module, no in-repetition
+                              # loss term, forward() output unchanged.
+in_rep_hidden_dim: 512        # InRepetitionHead's first hidden width
+in_rep_dropout: null          # null -> reuse `dropout` above
+weight_in_repetition: 3     # loss weight; only applied when use_in_repetition=true
+in_rep_loss_mode: bce       # 'focal'    - binary focal loss (Lin et al., 2017): down-weights
+                              #              easy/majority frames, focuses on hard/misclassified ones
+                              # 'balanced' - per-class BCE mean, combined alpha/(1-alpha)
+                              # 'bce'      - plain unweighted BCEWithLogits mean (no class balancing)
+in_rep_focal_alpha: 0.7       # positive-class weight (repetition frames); negative class gets
+                              # (1 - alpha). Used by 'focal' and 'balanced' modes.
+in_rep_focal_gamma: 2.0       # focusing exponent, 'focal' mode only; 0 -> plain alpha-weighted
+                              # BCE, higher -> more down-weighting of easy examples
+
+# ── rate head (auxiliary, optional) ────────────────────────────────────────────
+# Investigates whether an auxiliary per-clip repetition-RATE regressor
+# improves the shared temporal representation. Predicts how many repetitions
+# this clip would contain over a FIXED reference length of `reference_length`
+# temporal tokens (rate_gt = gt_count * reference_length / T) rather than the
+# clip's own (variable) T -- avoids a tiny-target/tiny-gradient problem a raw
+# count/T target (typically ~0.01-0.1) would cause. "How many repetitions
+# would this video contain in `reference_length` timesteps at the same
+# rate?" Purely additive: consumes the same shared `rows` bottleneck as
+# DensityHead/PhaseHead/InRepetitionHead, independent of both, but its own
+# output never feeds density/count. See model.RateHead, loss.RateLoss.
+rate_prediction:
+  enabled: false               # false (default): behaves EXACTLY as before this
+                              # existed -- no rate_head module, no rate loss
+                              # term, forward() output unchanged.
+  reference_length: 128        # fixed temporal-token reference length the
+                              # target is rescaled to (see RateHead/RateLoss).
+  loss_weight: 1.0              # lambda_rate; only applied when enabled=true
+  mode: smooth_l1              # 'smooth_l1' (Huber, see beta) | 'l1' | 'mse'
+  beta: 1.0                    # smooth_l1 beta, only used when mode: smooth_l1
+rate_hidden_dim: 512          # RateHead's first hidden width
+rate_dropout: null            # null -> reuse `dropout` above
+
+# ── count head (auxiliary, optional) ────────────────────────────────────────────
+# Investigates whether a small pooled/per-frame MLP can regress the count
+# DIRECTLY from the shared `rows` bottleneck, independent of the unsupervised
+# per-frame density map -- follow-up on the P-vs-2P periodicity investigation
+# (see p_vs_2p_analysis.py): ~1/3 of fast, bilateral-motion clips already have
+# their strongest latent period at 2x the annotated repetition rate BEFORE
+# the TCN runs, in both Countix and RepCount -- this tests whether that
+# mapping ("2P cycle = 2 reps") is learnable directly. Unlike RateHead, no
+# fixed-reference-length rescaling: the target is gt_count itself. Purely
+# additive: consumes the same shared `rows` bottleneck as DensityHead/
+# PhaseHead/InRepetitionHead/RateHead, independent of all of them, but its
+# own output never feeds density/count. See model.CountHead, loss.CountHeadLoss.
+count_head:
+  enabled: false               # false (default): behaves EXACTLY as before this
+                              # existed -- no count_head module, no count_head
+                              # loss term, forward() output unchanged.
+  mode: per_video               # 'per_video': mean-pool `rows` over T then MLP ->
+                              # one scalar per clip. 'per_frame': MLP per
+                              # timestep, summed over T (mirrors DensityHead's
+                              # per-frame-then-sum count path, own architecture).
+  loss_weight: 1.0               # lambda_count_head; only applied when enabled=true
+  loss_mode: smooth_l1          # 'smooth_l1' (Huber, see beta) | 'l1' | 'mse'
+  beta: 1.0                    # smooth_l1 beta, only used when loss_mode: smooth_l1
+  dropout: 0.25                 # CountHead's Dropout probability (between its two
+                              # hidden Linears)
+
+# ── future prediction head (auxiliary, optional) ──────────────────────────────
+# Investigates whether predicting the frozen encoder's OWN future embeddings
+# (t+horizon) from the shared temporal bottleneck improves that bottleneck's
+# representation for counting. Purely additive: the density/count/phase
+# heads, their losses, and checkpoints are unaffected either way. See
+# model.FuturePredictionHead / loss.FuturePredictionLoss.
+future_prediction:
+  enabled: true               # false -> no future_head module, no future loss
+                              # term, forward() output unchanged.
+  horizon: 12                  # predict encoder embedding this many frames ahead
+  loss_weight: 10            # lambda_future
+  mode: smooth_l1                # 'cosine' (1 - cosine_similarity) | 'smooth_l1' (Huber, elementwise)
+  smooth_l1_beta: 0.05          #0.05 # only used when mode: smooth_l1 -- see torch.nn.functional.smooth_l1_loss
+  residual: true              # false -> head predicts the ABSOLUTE future embedding e_{t+horizon}
+                                # (legacy behaviour). true -> head predicts the RESIDUAL change
+                                # Delta z = e_{t+horizon} - e_t instead (see loss.FuturePredictionLoss).
+                                # Purely a loss-target choice -- doesn't change the head's architecture
+                                # or checkpoint shape, only what it's supervised to approximate.
+  use_velocity: false
+
+# ── outside-repetition penalty (auxiliary, optional) ───────────────────────────
+# Hinge-penalizes predicted density MASS placed outside any annotated
+# repetition (phase_mask == 0) -- discourages the density head from "leaking"
+# a little count into non-repetition frames instead of concentrating it at
+# real repetitions. DensityLoss's per-frame MSE barely notices this (a small
+# amount of density smeared across many outside frames moves each frame's
+# squared error very little), but pred_count = pred_density.sum(-1) is a SUM,
+# so leaked mass still directly inflates the count prediction. Purely
+# additive, uses phase_mask (already computed regardless of use_phase/
+# use_in_repetition) -- no dataset changes needed. See
+# loss.OutsideRepetitionLoss.
+outside_repetition_penalty:
+  enabled: false               # false (default): identical to current behaviour --
+                              # no outside-penalty term, forward() output unchanged.
+  loss_weight: 1          # lambda_outside. Start conservative (auxiliary losses
+                              # have previously hurt counting performance here) --
+                              # try 0, 0.001, 0.005, 0.01; avoid starting at 0.1.
+  tau: 0.05                   # hinge tolerance: total outside-mass below this (per
+                              # clip) is not penalised at all -- allows a little
+                              # harmless leakage near repetition boundaries (imperfect
+                              # annotations, VideoMAE's temporal receptive field).
+
+# ── zero-count penalty (auxiliary, optional) ───────────────────────────────────
+# Hinge-penalizes predicted COUNT on windows whose ground-truth count is (near)
+# zero -- CountLoss doesn't single these out (relative mode entangles a
+# zero-count example's error with every other example's gt-scaled denominator;
+# l1 mode gives it no special weight at all), so this term exists to directly
+# stamp out false-positive counting on true-negative (no repetition) clips.
+# Purely additive -- no dataset/model changes needed, only uses pred_count/
+# gt_count already computed for CountLoss. See loss.ZeroCountLoss.
+zero_count_penalty:
+  enabled: false               # false (default): identical to current behaviour --
+                              # no zero-penalty term, forward() output unchanged.
+  loss_weight: 0.5               # lambda_zero.
+  tolerance: 0.1                # zero_tolerance: predicted count below this on a
+                              # zero-count window incurs no penalty at all.
+  count_threshold: 0.0          # gt_count <= this is treated as "zero" (0.0 = exact
+                              # zero-count windows only; raise slightly to also
+                              # cover near-zero/noisy annotations).
+
+# use_density is STRUCTURAL (does the DensityHead submodule exist at all),
+# distinct from lambda_density above (a LOSS WEIGHT on a head that still
+# exists). Setting lambda_density=0 keeps the head, its parameters, and
+# density.sum() as the count path -- it just stops supervising the curve's
+# shape. use_density=false actually removes the head: count instead comes
+# from -- in priority order -- CountHead's own prediction directly (if
+# count_head.enabled=true), else integrating/unwrapping the PhaseHead's
+# prediction over time (model.count_from_phase, if use_phase=true). Requires
+# count_head.enabled=true or use_phase=true (nothing else to count from
+# otherwise). To get count from CountHead ONLY: use_density=false,
+# count_head.enabled=true, use_phase=false -- then also set
+# count_head.loss_weight as desired (lambda_count/lambda_density are moot
+# here since there's no density head left for them to weight).
+use_density: true
+
+density_hidden_1: 64          # DensityHead's first hidden width (input_dim=tcn_dim -> this ->
+                              # density_hidden_2 -> 1). 64 (default) matches this codebase's
+                              # long-standing hardcoded value -- unchanged legacy behaviour.
+                              # DensityHead is the head that actually produces pred_count in
+                              # every use_density=true run (density.sum()), yet this hidden
+                              # size has never scaled with tcn_dim across any tcn_dim sweep
+                              # (256/512/1024/2048) -- 64 is already a steep bottleneck at
+                              # tcn_dim=256, a 16:1 squeeze at tcn_dim=1024. DensityHead's own
+                              # class default is 512 -- worth trying if tcn_dim is large.
+                              # Changes state_dict shape -- must match between train/eval/
+                              # checkpoint, like tcn_dim.
+density_hidden_2: 64          # DensityHead's second hidden width. 64 (default) matches this
+                              # codebase's long-standing hardcoded value. DensityHead's own
+                              # class default is 256. Changes state_dict shape.
+
+# ── training ──────────────────────────────────────────────────────────────────
+batch_size: 8
+epochs: 200
+learning_rate: 5.0e-4
+weight_decay: 1.0e-4
+num_workers: 8
+torch_threads: 8              # cap the main process's CPU intra-op thread pool;
+                              # on many-core boxes torch defaults to nproc threads,
+                              # which oversubscribes and steals CPU from DataLoader
+                              # workers even though the heavy compute runs on GPU
+pin_memory: true
+persistent_workers: true
+prefetch_factor: 2            # async prefetch of decoded frames per worker; total
+                              # in-flight batches = prefetch_factor * num_workers,
+                              # each ~batch_size*clip_length*3*image_size^2*4 bytes
+                              # shared via /dev/shm -- keep the product comfortably
+                              # under `df -h /dev/shm` or DataLoader workers crash
+                              # with "unable to allocate shared memory"
+grad_clip: 1.0
+weighted_sampler: false       # upsample rare high-count videos
+weighted_sampler_bin_strategy: width  # 'width' (default, legacy): n_bins equal-WIDTH bins
+                              # over the raw count value range. Badly miscalibrated on
+                              # right-skewed count distributions (verified on Countix:
+                              # 77% of videos in [2,10) get crushed to 11% of total
+                              # sampling weight, while a couple of outliers get
+                              # per-sample weight rivaling the whole majority). 'quantile':
+                              # equal-POPULATION bins -- same majority gets ~73% of total
+                              # weight instead, still upsamples the genuine tail without
+                              # starving the bulk. Prefer 'quantile' on skewed datasets.
+                              # See utils._rarity_weights.
+zero_count_upweight: 1      # sampling weight multiplier for ZERO-count videos (1.0 =
+                              # no upweight, e.g. 5.0 -> a zero-count video is ~5x as
+                              # likely to be drawn per epoch as a typical non-zero one).
+                              # Zero-count videos are usually extremely scarce in
+                              # RepCount-style data, so without this the model rarely
+                              # sees a true "no repetition" example -- composes with (or
+                              # substitutes for) zero_count_penalty below, which attacks
+                              # the same false-positive-counting problem via the loss
+                              # instead of the data. Composes with weighted_sampler=true
+                              # (starts from its rarity weights instead of uniform) but
+                              # mutually exclusive with full_video_sampling.enabled, same
+                              # as weighted_sampler. See utils.make_zero_upweight_sampler.
+rate_weighted_sampler: false  # upsample rare REPETITION RATES S = T/count (frames per
+                              # repetition -- see plot_temporal_resolution_vs_error.py),
+                              # both very fast AND very slow videos. NOT the same axis as
+                              # weighted_sampler above (rare absolute COUNT) -- a short,
+                              # fast video can have a perfectly ordinary count, so
+                              # weighted_sampler doesn't specifically target it. Mutually
+                              # exclusive with weighted_sampler/zero_count_upweight above
+                              # and full_video_sampling.enabled (one sampler at a time).
+                              # See utils.make_rate_sampler.
+                              #
+                              # IMPORTANT, checked empirically on Countix/train before
+                              # relying on this: fast-repetition (low-S) videos are NOT
+                              # rare here -- the bottom 2 S-deciles alone are 52.7% of
+                              # training videos, while the top 3 deciles (slowest/lowest-
+                              # count) are just 3.9% combined. So the model's undercounting
+                              # of fast-rep videos (see per-bin bias analysis) is unlikely
+                              # to be a training-EXPOSURE problem -- it already sees more
+                              # fast-rep examples than any other kind, which points at an
+                              # architectural/resolution ceiling (density-head/TCN can't
+                              # resolve many closely-packed cycles in one window) instead,
+                              # something this sampler can't fix. The slow/low-count tail
+                              # IS genuinely rare AND has the worst measured relative MAE --
+                              # that's the end this is actually likely to help.
+rate_weighted_sampler_bin_strategy: width  # 'width' | 'quantile' -- unlike
+                              # weighted_sampler_bin_strategy above, 'quantile' is close to
+                              # a NO-OP on this axis: S is continuous (no value ties), so
+                              # quantile edges land on truly equal-population bins and
+                              # inverse-population weights come out nearly flat (~1.00x
+                              # everywhere, verified empirically). Raw count is heavily
+                              # discrete/tied (many videos share e.g. count=2,3,4), which is
+                              # what makes quantile binning actually differentiate weights
+                              # there. 'width' is the one that does something here -- and
+                              # given the population skew above, it upweights the rare SLOW
+                              # tail several-fold, not the fast one.
+amp: true                     # automatic mixed precision
+
+# ── validation / early stopping ───────────────────────────────────────────────
+val_every: 5                 # run validation every N epochs
+early_stop_patience: 5       # stop if val MAE hasn't improved in N validations
+early_stop_min_delta: 0.0
+
+# ── bookkeeping ───────────────────────────────────────────────────────────────
+save_dir: ./runs/repcount_notrim_kernel3 # runs/0interp_repcount1/best.pt
+resume: null                  # path to a checkpoint to resume from, or null
+random_seed: 42
+deterministic: false
+log_every: 20                 # log train loss every N iterations
