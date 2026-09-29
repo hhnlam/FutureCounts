@@ -98,3 +98,5 @@ off-by-one accuracy (`|pred-gt| <= 1`). Both configs assume their
 `decoded_frame_root`/`val_frame_root`/`cached_feature_root` paths exist
 locally (see Data above) — edit those paths for your own cache layout
 before training.
+
+Trained checkpoints can be found here: https://liveuclac-my.sharepoint.com/:f:/g/personal/ucabhhn_ucl_ac_uk/IgAveGz1ZkG7RI1NuRS6Y1rCAUfMLkcLrJ59jMlIbnPg3Zs?e=J607WY (pw: futurecounts)
