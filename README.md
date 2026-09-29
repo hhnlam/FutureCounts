@@ -4,14 +4,8 @@ Video repetition counting via per-frame density regression over a frozen
 VideoMAE encoder, with an auxiliary future-embedding-prediction task that
 shapes the shared temporal representation.
 
-```
-video clip (B, T, 3, 224, 224)
-    -> frozen VideoMAE encoder (ViT-B, patch16, tubelet2)   [not trained]
-    -> learned spatial pool (grid tokens -> 1 vector/frame)  [SpatialAttentionPool]
-    -> Linear projection -> Dilated TCN                      [linear_proj1, tcn]
-    -> DensityHead (per-frame FC + Softplus)                 -> density(t)
-    -> count = sum_t density(t)
-```
+<img width="6000" height="1496" alt="image" src="https://github.com/user-attachments/assets/2b8e8861-0e57-48ce-bca2-ac846c5fc8a1" />
+
 
 Auxiliary heads (each independently switchable in `config.yaml`, off by
 default except where noted) share the same temporal bottleneck and are
